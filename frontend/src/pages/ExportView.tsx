@@ -29,17 +29,19 @@ export default function ExportView() {
     const observations = store.state.observations;
     const assays = store.state.assays;
     const schedules = store.state.schedules;
-    const passCount = assays.filter((row) => effectiveVerdict(row) === '达标').length;
+    const activeAssays = assays.filter((row) => row.status === '有效');
+    const passCount = activeAssays.filter((row) => effectiveVerdict(row) === '达标').length;
     const done = schedules.filter((row) => row.state === '已出卤').length;
-    const readyPonds = new Set(assays.filter((row) => effectiveVerdict(row) === '达标').map((row) => row.pondId)).size;
+    const readyPonds = new Set(activeAssays.filter((row) => effectiveVerdict(row) === '达标').map((row) => row.pondId)).size;
     return {
       ponds: ponds.length,
       observations: observations.length,
-      assays: assays.length,
+      assays: activeAssays.length,
+      voidedAssays: assays.length - activeAssays.length,
       gates: store.state.gates.length,
       schedules: schedules.length,
       passCount,
-      passPct: assays.length === 0 ? 0 : Math.round((passCount / assays.length) * 1000) / 10,
+      passPct: activeAssays.length === 0 ? 0 : Math.round((passCount / activeAssays.length) * 1000) / 10,
       donePct: schedules.length === 0 ? 0 : Math.round((done / schedules.length) * 1000) / 10,
       readyPonds,
     };
@@ -98,7 +100,13 @@ export default function ExportView() {
         <StatBadge label="蒸发池" value={summary().ponds} suffix="口" tone="primary" />
         <StatBadge label="闸门串级" value={summary().gates} suffix="条" tone="info" />
         <StatBadge label="观测条数" value={summary().observations} suffix="条" tone="info" />
-        <StatBadge label="化验条数" value={summary().assays} suffix="条" tone="default" />
+        <StatBadge
+          label="有效化验单"
+          value={summary().assays}
+          suffix="张"
+          tone="default"
+          hint={summary().voidedAssays > 0 ? `另有 ${summary().voidedAssays} 张复检作废单留存备查` : '化验室按取样批次出具的化验单'}
+        />
         <StatBadge
           label="达标占比"
           value={`${summary().passPct}%`}
@@ -113,7 +121,7 @@ export default function ExportView() {
           value={`v${DB_SCHEMA_VERSION}`}
           suffix={`· ${DB_NAME}`}
           tone="default"
-          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录"
+          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录，v3 引入取样批次对账（化验单批次/作废/复检链、编排对账键），旧数据按池号回填批次"
         />
       </div>
 

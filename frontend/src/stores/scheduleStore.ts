@@ -1,6 +1,7 @@
 /**
  * 走水编排状态管理（Solid 原生能力）
  * 用 createStore 维护走水顺序与状态推进；出卤完成后回写池阶段与实际密度。
+ * 推进走水前按「池号 + 取样批次」与化验室对账：同批次有效化验单判定达标才放行。
  */
 import { createRoot, createSignal } from 'solid-js';
 import { createStore } from 'solid-js/store';
@@ -8,6 +9,7 @@ import { liveQuery } from 'dexie';
 import type { Schedule, ScheduleDraft, ScheduleState } from '../types/schedule';
 import { SCHEDULE_STATE_FLOW } from '../types/schedule';
 import {
+  ROW_REVISION,
   advanceScheduleState,
   db,
   initDatabase,
@@ -15,6 +17,7 @@ import {
   removeSchedule,
   reorderSchedules,
 } from '../utils/db';
+import { reconcileBatch } from '../utils/brine';
 import { nowIso, uuid } from '../utils/id';
 import { usePondStore } from './pondStore';
 
@@ -78,15 +81,17 @@ function createScheduleStore() {
     const row: Schedule = {
       id: uuid('schedule'),
       pondId: draft.pondId,
+      sampleBatch: draft.sampleBatch.trim(),
       planDate: draft.planDate,
       targetDensity: draft.targetDensity,
       volumeM3: draft.volumeM3,
       operator: draft.operator.trim(),
       state: draft.state,
       orderIndex: draft.orderIndex,
+      returnNote: '',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
     await putSchedule(row);
     setState('lastMessage', `已新建走水计划：${row.planDate}`);
@@ -99,6 +104,7 @@ function createScheduleStore() {
     await putSchedule({
       ...existing,
       pondId: draft.pondId,
+      sampleBatch: draft.sampleBatch.trim(),
       planDate: draft.planDate,
       targetDensity: draft.targetDensity,
       volumeM3: draft.volumeM3,
@@ -114,6 +120,10 @@ function createScheduleStore() {
     setState('lastMessage', '走水计划已删除');
   }
 
+  /**
+   * 逐条推进走水状态。推进前按「池号 + 取样批次」对账：
+   * 化验室对同一批次判了达标才放行；对账不通过返回 null 并写明原因。
+   */
   async function advance(scheduleId: string): Promise<ScheduleState | null> {
     const existing = state.rows.find((row) => row.id === scheduleId);
     if (existing === undefined) return null;
@@ -121,6 +131,11 @@ function createScheduleStore() {
     if (index < 0 || index >= SCHEDULE_STATE_FLOW.length - 1) return null;
     const next = SCHEDULE_STATE_FLOW[index + 1];
     const pondStore = usePondStore();
+    const check = reconcileBatch(existing.pondId, existing.sampleBatch, pondStore.state.assays);
+    if (!check.ok) {
+      setState('lastMessage', `对账未通过，不能推进到「${next}」：${check.reason}`);
+      return null;
+    }
     const stat = pondStore.statOf(existing.pondId);
     const actualDensity = stat.currentDensity > 0 ? stat.currentDensity : existing.targetDensity;
     await advanceScheduleState(scheduleId, next, actualDensity);
@@ -129,7 +144,7 @@ function createScheduleStore() {
       'lastMessage',
       next === '已出卤'
         ? `已出卤：池阶段已推进，实际密度回写为 ${actualDensity} g/cm³`
-        : `状态已推进为「${next}」`,
+        : `对账通过（${check.reason}），状态已推进为「${next}」${existing.returnNote === '' ? '' : '，退回件已完成本侧重排'}`,
     );
     return next;
   }

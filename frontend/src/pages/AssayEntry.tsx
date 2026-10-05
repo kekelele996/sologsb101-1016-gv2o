@@ -1,6 +1,7 @@
 /**
- * /assays 离子组分分析录入与达标判定
- * 录入 Li⁺ / K⁺ / Mg²⁺ / Na⁺，自动判定达标并允许人工覆盖；按池与日期区间叠加组分曲线。
+ * /assays 离子组分分析（化验室端）
+ * 按取样批次出具化验单：录入 Li⁺ / K⁺ / Mg²⁺ / Na⁺，自动判定达标并允许人工覆盖。
+ * 复检更新结论后原化验单作废（两次结论都留存），用过该批次的走水编排联动退回待排。
  * 消费模型：Assay、Pond、Observation；复用组件：<StageTag>、<StatBadge>、<FilterBar>、<EmptyPanel>
  */
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js';
@@ -16,10 +17,11 @@ import {
   ASSAY_VERDICT_OPTIONS,
   type Assay,
   type AssayDraft,
+  type AssayStatus,
   type AssayVerdict,
 } from '../types/assay';
 import { ASSAY_THRESHOLD, autoVerdict, effectiveVerdict, ionEquivalent } from '../utils/brine';
-import { db, putAssay, removeAssay } from '../utils/db';
+import { ROW_REVISION, applyRetest, db, putAssay, removeAssay } from '../utils/db';
 import { nowIso, today, uuid } from '../utils/id';
 
 const INPUT =
@@ -36,9 +38,20 @@ const VERDICT_STYLE: Record<AssayVerdict, string> = {
   未达标: 'border-slate-300 bg-slate-100 text-slate-500',
 };
 
-function emptyDraft(pondId: string): AssayDraft {
+const STATUS_STYLE: Record<AssayStatus, string> = {
+  有效: 'border-sky-300 bg-sky-50 text-sky-700',
+  作废: 'border-slate-300 bg-slate-100 text-slate-400 line-through',
+};
+
+/** 批次号建议：池号-取样日期（MMDD），与迁移回填规则一致 */
+function suggestBatch(pondCode: string, date: string): string {
+  return `${pondCode}-${date.replace(/-/g, '').slice(4)}`;
+}
+
+function emptyDraft(pondId: string, sampleBatch: string): AssayDraft {
   return {
     pondId,
+    sampleBatch,
     date: today(),
     liGpl: 0.5,
     kGpl: 12,
@@ -50,26 +63,31 @@ function emptyDraft(pondId: string): AssayDraft {
   };
 }
 
+/** 录入对话框的三种形态：新建 / 编辑 / 复检 */
+type DialogMode = 'create' | 'edit' | 'retest';
+
 export default function AssayEntry() {
   const pondStore = usePondStore();
 
   const [rows, setRows] = createSignal<Assay[]>([]);
   const [loading, setLoading] = createSignal(true);
+  const [dialogMode, setDialogMode] = createSignal<DialogMode>('create');
   const [dialogOpen, setDialogOpen] = createSignal(false);
   const [editingId, setEditingId] = createSignal<string | null>(null);
+  const [retestSource, setRetestSource] = createSignal<Assay | null>(null);
   const [deleting, setDeleting] = createSignal<Assay | null>(null);
   const [message, setMessage] = createSignal('');
   const [keyword, setKeyword] = createSignal('');
   const [from, setFrom] = createSignal('');
   const [to, setTo] = createSignal('');
   const [curvePondId, setCurvePondId] = createSignal('');
-  const [draft, setDraft] = createStore<AssayDraft>(emptyDraft(''));
+  const [draft, setDraft] = createStore<AssayDraft>(emptyDraft('', ''));
 
   onMount(() => {
     void pondStore.loadAll();
     const subscription = liveQuery(async () => {
       const list = await db.assays.toArray();
-      return list.sort((a, b) => a.date.localeCompare(b.date));
+      return list.sort((a, b) => a.date.localeCompare(b.date) || a.round - b.round);
     }).subscribe({
       next: (list) => {
         setRows(list);
@@ -91,10 +109,14 @@ export default function AssayEntry() {
     return pond === null ? '（池已删除）' : `${pond.code} · ${pond.seriesName}`;
   };
 
+  /** 未登记取样批次的化验单（升级遗留、对不上池号）—— 单列，补登批次后才参与对账 */
+  const unmatched = createMemo<Assay[]>(() => rows().filter((row) => row.sampleBatch.trim() === ''));
+
   const filtered = createMemo<Assay[]>(() => {
     const series = pondStore.state.currentSeries;
     const key = keyword().trim().toLowerCase();
     return rows().filter((row) => {
+      if (row.sampleBatch.trim() === '') return false;
       const pond = pondOf(row.pondId);
       if (series !== null && pond?.seriesName !== series) return false;
       if (from() !== '' && row.date < from()) return false;
@@ -103,34 +125,39 @@ export default function AssayEntry() {
       return (
         pondLabel(row.pondId).toLowerCase().includes(key) ||
         row.labName.toLowerCase().includes(key) ||
+        row.sampleBatch.toLowerCase().includes(key) ||
         row.date.includes(key)
       );
     });
   });
 
+  /** 统计只计有效化验单；作废单结论留存备查但不参与达标判定 */
   const stats = createMemo(() => {
     const list = filtered();
-    const pass = list.filter((row) => effectiveVerdict(row) === '达标').length;
-    const near = list.filter((row) => effectiveVerdict(row) === '接近').length;
-    const fail = list.filter((row) => effectiveVerdict(row) === '未达标').length;
-    const readyPonds = new Set(list.filter((row) => effectiveVerdict(row) === '达标').map((row) => row.pondId)).size;
+    const active = list.filter((row) => row.status === '有效');
+    const pass = active.filter((row) => effectiveVerdict(row) === '达标').length;
+    const near = active.filter((row) => effectiveVerdict(row) === '接近').length;
+    const fail = active.filter((row) => effectiveVerdict(row) === '未达标').length;
+    const voided = list.filter((row) => row.status === '作废').length;
+    const readyPonds = new Set(active.filter((row) => effectiveVerdict(row) === '达标').map((row) => row.pondId)).size;
     return {
-      total: list.length,
+      total: active.length,
       pass,
       near,
       fail,
+      voided,
       readyPonds,
-      passPct: list.length === 0 ? 0 : Math.round((pass / list.length) * 1000) / 10,
+      passPct: active.length === 0 ? 0 : Math.round((pass / active.length) * 1000) / 10,
     };
   });
 
   const previewVerdict = createMemo<AssayVerdict>(() => autoVerdict(draft.liGpl, draft.kGpl));
 
-  /** 组分曲线：按池与日期区间叠加 Li⁺ 与 K⁺ 折线 */
+  /** 组分曲线：按池与日期区间叠加 Li⁺ 与 K⁺ 折线（仅计有效化验单） */
   const curve = createMemo(() => {
     const pondId = curvePondId();
     const list = rows()
-      .filter((row) => row.pondId === pondId)
+      .filter((row) => row.pondId === pondId && row.status === '有效')
       .filter((row) => (from() === '' || row.date >= from()) && (to() === '' || row.date <= to()))
       .sort((a, b) => a.date.localeCompare(b.date));
     const width = 660;
@@ -157,15 +184,21 @@ export default function AssayEntry() {
       curvePondId() !== ''
         ? curvePondId()
         : (pondStore.pondsOfSeries(pondStore.state.currentSeries)[0]?.id ?? pondStore.state.ponds[0]?.id ?? '');
+    const pond = pondOf(pondId);
+    setDialogMode('create');
     setEditingId(null);
-    setDraft(emptyDraft(pondId));
+    setRetestSource(null);
+    setDraft(emptyDraft(pondId, pond === null ? '' : suggestBatch(pond.code, today())));
     setDialogOpen(true);
   };
 
   const openEdit = (row: Assay): void => {
+    setDialogMode('edit');
     setEditingId(row.id);
+    setRetestSource(null);
     setDraft({
       pondId: row.pondId,
+      sampleBatch: row.sampleBatch,
       date: row.date,
       liGpl: row.liGpl,
       kGpl: row.kGpl,
@@ -178,36 +211,110 @@ export default function AssayEntry() {
     setDialogOpen(true);
   };
 
+  /** 复检：同池同批次出具第 N+1 次化验单，保存时原单作废、相关编排退回待排 */
+  const openRetest = (row: Assay): void => {
+    setDialogMode('retest');
+    setEditingId(null);
+    setRetestSource(row);
+    setDraft({
+      pondId: row.pondId,
+      sampleBatch: row.sampleBatch,
+      date: today(),
+      liGpl: row.liGpl,
+      kGpl: row.kGpl,
+      mgGpl: row.mgGpl,
+      naGpl: row.naGpl,
+      labName: row.labName,
+      verdict: row.verdict,
+      verdictManual: false,
+    });
+    setDialogOpen(true);
+  };
+
+  const dialogTitle = (): string => {
+    if (dialogMode() === 'retest') {
+      const source = retestSource();
+      return `批次复检（第 ${source === null ? 2 : source.round + 1} 次化验）`;
+    }
+    return dialogMode() === 'create' ? '按取样批次出具化验单' : '编辑化验单';
+  };
+
   const submit = async (): Promise<void> => {
     if (draft.pondId === '') {
       setMessage('请选择蒸发池');
       return;
     }
-    const payload: Omit<Assay, 'createdAt' | 'updatedAt' | 'revision'> = {
-      id: editingId() ?? uuid('assay'),
+    const batch = draft.sampleBatch.trim();
+    if (batch === '') {
+      setMessage('请填写取样批次号，调度端按「池号 + 取样批次」对账');
+      return;
+    }
+    const mode = dialogMode();
+    // 同一批次已存在有效化验单时，新结论必须走「复检」流程，保证旧单作废、两次结论都留存
+    if (mode === 'create') {
+      const duplicated = rows().some(
+        (row) => row.pondId === draft.pondId && row.sampleBatch === batch && row.status === '有效',
+      );
+      if (duplicated) {
+        setMessage(`批次 ${batch} 已有有效化验单，如需更新结论请在该单上点「复检」`);
+        return;
+      }
+    }
+    const payload = {
       pondId: draft.pondId,
+      sampleBatch: batch,
       date: draft.date,
       liGpl: draft.liGpl,
       kGpl: draft.kGpl,
       mgGpl: draft.mgGpl,
       naGpl: draft.naGpl,
       labName: draft.labName.trim() || '未填写化验室',
-      verdict: draft.verdictManual ? draft.verdict : previewVerdict(),
+      verdict: (draft.verdictManual ? draft.verdict : previewVerdict()) as AssayVerdict,
       verdictManual: draft.verdictManual,
     };
-    if (editingId() === null) {
-      const stamp = nowIso();
-      await putAssay({ ...payload, createdAt: stamp, updatedAt: stamp, revision: 2 });
+    const stamp = nowIso();
+    if (mode === 'retest') {
+      const source = retestSource();
+      if (source === null) return;
+      const next: Assay = {
+        ...payload,
+        id: uuid('assay'),
+        pondId: source.pondId,
+        sampleBatch: source.sampleBatch,
+        status: '有效',
+        round: source.round + 1,
+        retestOf: source.id,
+        createdAt: stamp,
+        updatedAt: stamp,
+        revision: ROW_REVISION,
+      };
+      const returned = await applyRetest(source.id, next);
+      setMessage(
+        `批次 ${next.sampleBatch} 第 ${next.round} 次化验判定「${next.verdict}」，原第 ${source.round} 次化验单已作废留存` +
+          (returned > 0 ? `；${returned} 条走水编排已退回待排，由调度端本侧重排` : ''),
+      );
+    } else if (mode === 'create') {
+      const row: Assay = {
+        ...payload,
+        id: uuid('assay'),
+        status: '有效',
+        round: 1,
+        retestOf: null,
+        createdAt: stamp,
+        updatedAt: stamp,
+        revision: ROW_REVISION,
+      };
+      await putAssay(row);
       setMessage(
         payload.verdict === '达标'
-          ? `已录入 ${pondLabel(payload.pondId)} 的化验记录，判定达标，该池进入出卤候选`
-          : `已录入 ${pondLabel(payload.pondId)} 的化验记录，判定为「${payload.verdict}」`,
+          ? `已出具批次 ${row.sampleBatch} 的化验单，判定达标，调度端可对账排走水`
+          : `已出具批次 ${row.sampleBatch} 的化验单，判定为「${payload.verdict}」`,
       );
     } else {
       const existing = rows().find((row) => row.id === editingId());
       if (existing === undefined) return;
       await putAssay({ ...existing, ...payload });
-      setMessage('化验记录已更新');
+      setMessage('化验单已更新');
     }
     setDialogOpen(false);
   };
@@ -217,23 +324,30 @@ export default function AssayEntry() {
     if (row === null) return;
     await removeAssay(row.id);
     setDeleting(null);
-    setMessage('化验记录已删除');
+    setMessage('化验单已删除');
   };
 
   return (
     <div class="space-y-3.5">
       <div class="flex flex-wrap gap-3">
-        <StatBadge label="化验记录" value={stats().total} suffix="条" tone="primary" />
-        <StatBadge label="达标" value={stats().pass} suffix="条" tone="success" />
-        <StatBadge label="接近" value={stats().near} suffix="条" tone="warning" />
-        <StatBadge label="未达标" value={stats().fail} suffix="条" tone="default" />
+        <StatBadge label="有效化验单" value={stats().total} suffix="张" tone="primary" />
+        <StatBadge label="达标" value={stats().pass} suffix="张" tone="success" />
+        <StatBadge label="接近" value={stats().near} suffix="张" tone="warning" />
+        <StatBadge label="未达标" value={stats().fail} suffix="张" tone="default" />
+        <StatBadge
+          label="作废留存"
+          value={stats().voided}
+          suffix="张"
+          tone="default"
+          hint="复检后作废的化验单，结论保留备查，不参与判定"
+        />
         <StatBadge label="达标占比" value={`${stats().passPct}%`} percent={stats().passPct} tone="success" />
         <StatBadge
           label="出卤候选池"
           value={stats().readyPonds}
           suffix="口"
           tone={stats().readyPonds > 0 ? 'success' : 'default'}
-          hint="区间内存在达标化验记录的池数量"
+          hint="区间内存在有效达标化验单的池数量"
         />
       </div>
 
@@ -243,9 +357,9 @@ export default function AssayEntry() {
 
       <section class="rounded-xl border border-slate-200 bg-white p-4">
         <header class="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <h2 class="text-[15px] font-semibold text-slate-800">离子组分分析录入与达标判定</h2>
+          <h2 class="text-[15px] font-semibold text-slate-800">按取样批次出具化验单</h2>
           <button type="button" class={BTN_PRIMARY} onClick={openCreate} disabled={pondStore.state.ponds.length === 0}>
-            + 录入化验
+            + 出具化验单
           </button>
         </header>
 
@@ -263,7 +377,7 @@ export default function AssayEntry() {
             setTo('');
             pondStore.setCurrentSeries(pondStore.seriesOptions()[0] ?? null);
           }}
-          resultText={`命中 ${filtered().length} / ${rows().length} 条`}
+          resultText={`命中 ${filtered().length} / ${rows().length - unmatched().length} 张`}
         >
           <label class="flex items-center gap-1.5 text-[13px] text-slate-600">
             <span>日期区间</span>
@@ -286,19 +400,20 @@ export default function AssayEntry() {
         <Show when={rows().length === 0 && !loading()}>
           <EmptyPanel
             title="还没有离子组分分析记录"
-            description="录入 Li⁺ / K⁺ / Mg²⁺ / Na⁺ 浓度，系统按阈值自动判定达标情况，判定达标的池会自动进入出卤候选。"
-            actionText="录入第一条化验"
+            description="按取样批次出具化验单，录入 Li⁺ / K⁺ / Mg²⁺ / Na⁺ 浓度，系统按阈值自动判定达标情况；调度端按「池号 + 取样批次」对账，判定达标才推进走水。"
+            actionText="出具第一张化验单"
             onAction={openCreate}
           />
         </Show>
 
-        <Show when={rows().length > 0}>
+        <Show when={filtered().length > 0}>
           <div class="overflow-x-auto">
-            <table class="w-full min-w-[1080px] border-collapse text-sm">
+            <table class="w-full min-w-[1280px] border-collapse text-sm">
               <thead>
                 <tr class="border-b border-slate-200 bg-slate-50 text-left text-xs text-slate-500">
                   <th class="px-3 py-2">蒸发池</th>
                   <th class="px-3 py-2">阶段</th>
+                  <th class="px-3 py-2">取样批次</th>
                   <th class="px-3 py-2">取样日期</th>
                   <th class="px-3 py-2 text-right">Li⁺（g/L）</th>
                   <th class="px-3 py-2 text-right">K⁺（g/L）</th>
@@ -307,6 +422,7 @@ export default function AssayEntry() {
                   <th class="px-3 py-2 text-right">当量合计（meq/L）</th>
                   <th class="px-3 py-2">化验室</th>
                   <th class="px-3 py-2">判定</th>
+                  <th class="px-3 py-2">单据</th>
                   <th class="px-3 py-2">操作</th>
                 </tr>
               </thead>
@@ -314,11 +430,16 @@ export default function AssayEntry() {
                 <For each={filtered()}>
                   {(row) => {
                     const verdict = (): AssayVerdict => effectiveVerdict(row);
+                    const voided = (): boolean => row.status === '作废';
                     return (
-                      <tr class="border-b border-slate-100 hover:bg-slate-50/60">
+                      <tr class={`border-b border-slate-100 ${voided() ? 'bg-slate-50/50 text-slate-400' : 'hover:bg-slate-50/60'}`}>
                         <td class="px-3 py-2.5">{pondLabel(row.pondId)}</td>
                         <td class="px-3 py-2.5">
                           <StageTag stage={pondOf(row.pondId)?.stage ?? null} size="sm" />
+                        </td>
+                        <td class="px-3 py-2.5">
+                          <span class="font-medium text-slate-700">{row.sampleBatch}</span>
+                          <span class="ml-1 text-xs text-slate-400">第{row.round}次</span>
                         </td>
                         <td class="px-3 py-2.5">{row.date}</td>
                         <td class="px-3 py-2.5 text-right tabular-nums">{row.liGpl}</td>
@@ -336,10 +457,18 @@ export default function AssayEntry() {
                           </span>
                         </td>
                         <td class="px-3 py-2.5">
+                          <span class={`rounded border px-1.5 py-0.5 text-[11px] ${STATUS_STYLE[row.status]}`}>{row.status}</span>
+                        </td>
+                        <td class="px-3 py-2.5">
                           <div class="flex gap-2">
-                            <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
-                              编辑
-                            </button>
+                            <Show when={!voided()}>
+                              <button class="text-xs text-brine-700 hover:underline" onClick={() => openRetest(row)}>
+                                复检
+                              </button>
+                              <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
+                                编辑
+                              </button>
+                            </Show>
                             <button class="text-xs text-rose-600 hover:underline" onClick={() => setDeleting(row)}>
                               删除
                             </button>
@@ -354,9 +483,9 @@ export default function AssayEntry() {
           </div>
         </Show>
 
-        <Show when={filtered().length === 0 && rows().length > 0}>
+        <Show when={filtered().length === 0 && rows().length - unmatched().length > 0}>
           <EmptyPanel
-            title="没有符合筛选条件的化验记录"
+            title="没有符合筛选条件的化验单"
             description="可以放宽日期区间或切换池系，或直接重置筛选。"
             actionText="重置筛选"
             onAction={() => {
@@ -368,9 +497,62 @@ export default function AssayEntry() {
         </Show>
       </section>
 
+      <Show when={unmatched().length > 0}>
+        <section class="rounded-xl border border-amber-200 bg-amber-50/40 p-4">
+          <header class="mb-3">
+            <h2 class="text-[15px] font-semibold text-slate-800">未登记取样批次的化验单（{unmatched().length} 张）</h2>
+            <p class="mt-1 text-xs leading-relaxed text-slate-500">
+              升级遗留数据：旧记录没有登记取样批次，按池号回填时对不上池（池已删除），单列于此。
+              点「编辑」补登批次号后才参与调度端对账。
+            </p>
+          </header>
+          <div class="overflow-x-auto rounded-lg border border-amber-100 bg-white">
+            <table class="w-full min-w-[760px] border-collapse text-sm">
+              <thead>
+                <tr class="border-b border-slate-200 bg-slate-50 text-left text-xs text-slate-500">
+                  <th class="px-3 py-2">蒸发池</th>
+                  <th class="px-3 py-2">取样日期</th>
+                  <th class="px-3 py-2 text-right">Li⁺（g/L）</th>
+                  <th class="px-3 py-2 text-right">K⁺（g/L）</th>
+                  <th class="px-3 py-2">判定</th>
+                  <th class="px-3 py-2">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <For each={unmatched()}>
+                  {(row) => (
+                    <tr class="border-b border-slate-100 hover:bg-slate-50/60">
+                      <td class="px-3 py-2.5">{pondLabel(row.pondId)}</td>
+                      <td class="px-3 py-2.5">{row.date}</td>
+                      <td class="px-3 py-2.5 text-right tabular-nums">{row.liGpl}</td>
+                      <td class="px-3 py-2.5 text-right tabular-nums">{row.kGpl}</td>
+                      <td class="px-3 py-2.5">
+                        <span class={`rounded border px-1.5 py-0.5 text-[11px] ${VERDICT_STYLE[effectiveVerdict(row)]}`}>
+                          {effectiveVerdict(row)}
+                        </span>
+                      </td>
+                      <td class="px-3 py-2.5">
+                        <div class="flex gap-2">
+                          <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
+                            编辑补登批次
+                          </button>
+                          <button class="text-xs text-rose-600 hover:underline" onClick={() => setDeleting(row)}>
+                            删除
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </Show>
+
       <section class="rounded-xl border border-slate-200 bg-white p-4">
         <header class="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <h2 class="text-[15px] font-semibold text-slate-800">组分曲线（Li⁺ / K⁺）</h2>
+          <h2 class="text-[15px] font-semibold text-slate-800">组分曲线（Li⁺ / K⁺，仅计有效化验单）</h2>
           <label class="flex items-center gap-1.5 text-[13px] text-slate-600">
             <span>蒸发池</span>
             <select
@@ -395,7 +577,7 @@ export default function AssayEntry() {
           fallback={
             <EmptyPanel
               title="暂无可绘制的组分数据"
-              description="先选择一口有化验记录的蒸发池，或先在表格中录入化验记录。"
+              description="先选择一口有有效化验单的蒸发池，或先在表格中出具化验单。"
             />
           }
         >
@@ -451,7 +633,7 @@ export default function AssayEntry() {
 
       <AppDialog
         open={dialogOpen()}
-        title={editingId() === null ? '录入离子组分分析' : '编辑离子组分分析'}
+        title={dialogTitle()}
         onClose={() => setDialogOpen(false)}
         footer={
           <>
@@ -467,7 +649,19 @@ export default function AssayEntry() {
         <div class="grid gap-3 sm:grid-cols-2">
           <label class="flex flex-col gap-1 text-[13px] text-slate-600">
             <span>蒸发池</span>
-            <select class={INPUT} value={draft.pondId} onChange={(event) => setDraft('pondId', event.currentTarget.value)}>
+            <select
+              class={INPUT}
+              value={draft.pondId}
+              disabled={dialogMode() === 'retest'}
+              onChange={(event) => {
+                const pondId = event.currentTarget.value;
+                setDraft('pondId', pondId);
+                if (dialogMode() === 'create') {
+                  const pond = pondOf(pondId);
+                  if (pond !== null) setDraft('sampleBatch', suggestBatch(pond.code, draft.date));
+                }
+              }}
+            >
               <option value="">请选择</option>
               <For each={pondStore.state.ponds}>
                 {(pond) => (
@@ -479,8 +673,30 @@ export default function AssayEntry() {
             </select>
           </label>
           <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+            <span>取样批次</span>
+            <input
+              class={INPUT}
+              value={draft.sampleBatch}
+              disabled={dialogMode() === 'retest'}
+              placeholder="如：北-03-0924"
+              onInput={(event) => setDraft('sampleBatch', event.currentTarget.value)}
+            />
+          </label>
+          <label class="flex flex-col gap-1 text-[13px] text-slate-600">
             <span>取样日期</span>
-            <input type="date" class={INPUT} value={draft.date} onInput={(event) => setDraft('date', event.currentTarget.value)} />
+            <input
+              type="date"
+              class={INPUT}
+              value={draft.date}
+              onInput={(event) => {
+                const date = event.currentTarget.value;
+                setDraft('date', date);
+                if (dialogMode() === 'create') {
+                  const pond = pondOf(draft.pondId);
+                  if (pond !== null && date !== '') setDraft('sampleBatch', suggestBatch(pond.code, date));
+                }
+              }}
+            />
           </label>
           <label class="flex flex-col gap-1 text-[13px] text-slate-600">
             <span>Li⁺（g/L）</span>
@@ -555,13 +771,19 @@ export default function AssayEntry() {
           <span class="tabular-nums font-semibold">
             {ionEquivalent(draft.liGpl, draft.kGpl, draft.mgGpl, draft.naGpl)} meq/L
           </span>
-          。判定达标的池会自动进入出卤候选。
+          。调度端按「池号 + 取样批次」对账，同批次判定达标才推进走水。
         </p>
+        <Show when={dialogMode() === 'retest' && retestSource() !== null}>
+          <p class="mt-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800">
+            保存后：批次 {retestSource()?.sampleBatch} 第 {retestSource()?.round} 次化验单作废（结论保留备查），
+            本单记为第 {(retestSource()?.round ?? 1) + 1} 次；使用该批次的走水编排将退回待排，由调度端本侧重排。
+          </p>
+        </Show>
       </AppDialog>
 
       <AppDialog
         open={deleting() !== null}
-        title="确认删除化验记录？"
+        title="确认删除化验单？"
         width="max-w-lg"
         onClose={() => setDeleting(null)}
         footer={
@@ -576,7 +798,9 @@ export default function AssayEntry() {
         }
       >
         <p class="text-sm leading-relaxed text-slate-600">
-          将删除「{pondLabel(deleting()?.pondId ?? '')}」在 {deleting()?.date} 的化验记录，删除后该池可能不再属于出卤候选。
+          将删除「{pondLabel(deleting()?.pondId ?? '')}」批次 {deleting()?.sampleBatch || '（未登记）'} 第{' '}
+          {deleting()?.round} 次化验单{deleting()?.status === '作废' ? '（已作废留存）' : ''}
+          ，删除后调度端按该批次对账时将查无此单。
         </p>
       </AppDialog>
     </div>

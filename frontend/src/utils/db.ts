@@ -3,6 +3,8 @@
  * - 数据库名：gbbrinepond
  * - v1：建立全部表与 pondId+date 复合索引
  * - v2：新增 evapMm 字段并写入升级迁移逻辑，旧记录自动补齐默认值
+ * - v3：引入「取样批次」对账 —— 化验单新增 sampleBatch / status / round / retestOf，
+ *   走水编排新增 sampleBatch / returnNote；旧数据按池号回填批次，对不上池号的留空单列
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
 import Dexie, { type Table } from 'dexie';
@@ -19,10 +21,10 @@ import { seedDatabase } from './seed';
 export const DB_NAME = 'gbbrinepond';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class BrinePondDatabase extends Dexie {
   ponds!: Table<Pond, string>;
@@ -44,7 +46,7 @@ class BrinePondDatabase extends Dexie {
     });
 
     // ---------- v2：新增 evapMm 字段，并为旧记录补齐默认值 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
         gates: 'id, fromPondId, toPondId, state, openingPct',
@@ -87,6 +89,50 @@ class BrinePondDatabase extends Dexie {
           if (typeof row.orderIndex !== 'number') {
             const date = typeof row.planDate === 'string' ? row.planDate : '2026-01-01';
             row.orderIndex = Number(date.replace(/-/g, '')) || 1;
+          }
+        });
+      });
+
+    // ---------- v3：取样批次对账（化验室 ↔ 调度端） ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        assays: 'id, pondId, date, [pondId+date], verdict, verdictManual, sampleBatch, status, [pondId+sampleBatch]',
+        schedules: 'id, pondId, planDate, state, orderIndex, sampleBatch',
+      })
+      .upgrade(async (tx) => {
+        // 旧数据没登记取样批次：升级时按池号回填，对不上池号的留空，在页面上单列待补登
+        const ponds = (await tx.table('ponds').toArray()) as Pond[];
+        const pondById = new Map(ponds.map((pond) => [pond.id, pond]));
+
+        // 迁移 1：化验单补 sampleBatch / status / round / retestOf
+        await tx.table('assays').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.status !== 'string') row.status = '有效';
+          if (typeof row.round !== 'number') row.round = 1;
+          if (typeof row.retestOf !== 'string') row.retestOf = null;
+          if (typeof row.sampleBatch !== 'string' || row.sampleBatch === '') {
+            const pond = typeof row.pondId === 'string' ? pondById.get(row.pondId) : undefined;
+            const date = typeof row.date === 'string' ? row.date : '未知日期';
+            // 按池号回填：批次号 = 池号-取样日期；池已删除对不上的留空，由化验室单列补登
+            row.sampleBatch = pond === undefined ? '' : `${pond.code}-${date}`;
+          }
+        });
+
+        // 迁移 2：走水编排补 sampleBatch / returnNote
+        // 按池号回填该池最新一张有效化验单的批次，让旧编排直接对上账；
+        // 池对不上或该池没有有效化验单的留空，由调度端单列补登。
+        const assays = (await tx.table('assays').toArray()) as Assay[];
+        await tx.table('schedules').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.returnNote !== 'string') row.returnNote = '';
+          if (typeof row.sampleBatch !== 'string' || row.sampleBatch === '') {
+            const pond = typeof row.pondId === 'string' ? pondById.get(row.pondId) : undefined;
+            if (pond === undefined) {
+              row.sampleBatch = '';
+              return;
+            }
+            const candidates = assays
+              .filter((assay) => assay.pondId === row.pondId && assay.status === '有效' && assay.sampleBatch !== '')
+              .sort((a, b) => a.date.localeCompare(b.date) || a.round - b.round);
+            row.sampleBatch = candidates.length === 0 ? '' : candidates[candidates.length - 1].sampleBatch;
           }
         });
       });
@@ -217,6 +263,33 @@ export async function removeAssay(id: string): Promise<void> {
   await db.assays.delete(id);
 }
 
+/**
+ * 复检落单（化验室侧）：同一取样批次出具新化验单，原化验单作废。
+ * - 两次结论都留着：旧单仅标记「作废」不删除，新单轮次 +1 并挂到复检链上；
+ * - 用过该批次的走水编排（已排 / 走水中）在同一事务内退回「待排」并写明退回原因，
+ *   由调度端本侧重排；「已出卤」的终态编排不动。
+ * 返回退回待排的编排条数。
+ */
+export async function applyRetest(voidedId: string, next: Assay): Promise<number> {
+  let returned = 0;
+  await db.transaction('rw', db.assays, db.schedules, async () => {
+    const previous = await db.assays.get(voidedId);
+    if (!previous) return;
+    const stamp = nowIso();
+    await db.assays.update(previous.id, { status: '作废', updatedAt: stamp });
+    await db.assays.put({ ...next, status: '有效', updatedAt: stamp, revision: ROW_REVISION });
+    const related = await db.schedules.where('pondId').equals(previous.pondId).toArray();
+    const note = `批次 ${previous.sampleBatch} 第 ${previous.round} 次化验结论作废（复检第 ${next.round} 次判定「${next.verdict}」），退回待排`;
+    for (const schedule of related) {
+      if (schedule.sampleBatch !== previous.sampleBatch) continue;
+      if (schedule.state === '待排' || schedule.state === '已出卤') continue;
+      await db.schedules.update(schedule.id, { state: '待排', returnNote: note, updatedAt: stamp });
+      returned += 1;
+    }
+  });
+  return returned;
+}
+
 /* ------------------------------ 走水编排 ------------------------------ */
 
 export async function listSchedules(): Promise<Schedule[]> {
@@ -248,7 +321,7 @@ export async function applyDischarge(scheduleId: string, actualDensity: number):
   await db.transaction('rw', db.ponds, db.schedules, db.observations, async () => {
     const schedule = await db.schedules.get(scheduleId);
     if (!schedule) return;
-    await db.schedules.update(scheduleId, { state: '已出卤', updatedAt: nowIso() });
+    await db.schedules.update(scheduleId, { state: '已出卤', returnNote: '', updatedAt: nowIso() });
     const pond = await db.ponds.get(schedule.pondId);
     if (!pond) return;
     const nextStage: Pond['stage'] = pond.stage === '钠盐' ? '钾盐' : pond.stage === '钾盐' ? '锂盐' : '锂盐';
@@ -265,13 +338,13 @@ export async function applyDischarge(scheduleId: string, actualDensity: number):
   });
 }
 
-/** 推进走水状态 */
+/** 推进走水状态（推进即视为调度端完成本侧重排，清空退回标记） */
 export async function advanceScheduleState(scheduleId: string, next: ScheduleState, actualDensity: number): Promise<void> {
   if (next === '已出卤') {
     await applyDischarge(scheduleId, actualDensity);
     return;
   }
-  await db.schedules.update(scheduleId, { state: next, updatedAt: nowIso() });
+  await db.schedules.update(scheduleId, { state: next, returnNote: '', updatedAt: nowIso() });
 }
 
 /* ---------------------------- 整库快照 ---------------------------- */

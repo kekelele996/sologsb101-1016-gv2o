@@ -74,7 +74,7 @@ export function parseSnapshot(text: string): SnapshotParseResult {
   return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
 }
 
-/** 生成晒程进度汇总 CSV */
+/** 生成晒程进度汇总 CSV（化验判定只计有效化验单，作废留存单不参与） */
 export function buildProgressCsv(ponds: Pond[], observations: Observation[], assays: Assay[], schedules: Schedule[]): string {
   const header = [
     '池号',
@@ -89,6 +89,7 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
     '最近密度(g/cm³)',
     '最近蒸发量(mm/d)',
     '化验条数',
+    '最近取样批次',
     '最近判定',
     '走水计划数',
     '已完成出卤数',
@@ -97,7 +98,9 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
   ponds.forEach((pond) => {
     const pondObs = observations.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
     const latestObs = pondObs.length > 0 ? pondObs[pondObs.length - 1] : null;
-    const pondAssays = assays.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
+    const pondAssays = assays
+      .filter((row) => row.pondId === pond.id && row.status === '有效')
+      .sort((a, b) => a.date.localeCompare(b.date) || a.round - b.round);
     const latestAssay = pondAssays.length > 0 ? pondAssays[pondAssays.length - 1] : null;
     const pondSchedules = schedules.filter((row) => row.pondId === pond.id);
     lines.push(
@@ -114,6 +117,7 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
         latestObs === null ? 0 : latestObs.densityGcm3,
         latestObs === null ? 0 : latestObs.evapMm,
         pondAssays.length,
+        latestAssay === null ? '—' : latestAssay.sampleBatch,
         latestAssay === null ? '—' : effectiveVerdict(latestAssay),
         pondSchedules.length,
         pondSchedules.filter((row) => row.state === '已出卤').length,
@@ -150,20 +154,22 @@ export async function copyText(text: string): Promise<boolean> {
   return false;
 }
 
-/** 生成晒程调度通报纯文本 */
+/** 生成晒程调度通报纯文本（组分判定只计有效化验单） */
 export function buildBriefingText(ponds: Pond[], observations: Observation[], assays: Assay[], schedules: Schedule[]): string {
   const lines: string[] = [`【盐湖晒程调度通报】共 ${ponds.length} 口蒸发池`];
   ponds.forEach((pond) => {
     const pondObs = observations.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
     const latest = pondObs.length > 0 ? pondObs[pondObs.length - 1] : null;
-    const pondAssays = assays.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
+    const pondAssays = assays
+      .filter((row) => row.pondId === pond.id && row.status === '有效')
+      .sort((a, b) => a.date.localeCompare(b.date) || a.round - b.round);
     const lastAssay = pondAssays.length > 0 ? pondAssays[pondAssays.length - 1] : null;
     const pending = schedules.filter((row) => row.pondId === pond.id && row.state !== '已出卤').length;
     lines.push(
       `· ${pond.code}（${pond.seriesName} / ${pond.stage} / ${pond.status}）最近密度 ${
         latest === null ? '无观测' : `${latest.densityGcm3} g/cm³（${latest.date}）`
       }，蒸发量 ${latest === null ? '—' : `${round1(latest.evapMm)} mm/d`}，组分判定 ${
-        lastAssay === null ? '未化验' : effectiveVerdict(lastAssay)
+        lastAssay === null ? '未化验' : `${effectiveVerdict(lastAssay)}（批次 ${lastAssay.sampleBatch}）`
       }，待完成走水 ${pending} 条`,
     );
   });

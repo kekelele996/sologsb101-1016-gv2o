@@ -31,9 +31,9 @@ export interface PondStat {
   inboundGates: number;
   /** 下游闸门数 */
   outboundGates: number;
-  /** 最近组分判定 */
+  /** 最近组分判定（仅计有效化验单，作废单不参与） */
   lastVerdict: string;
-  /** 是否进入出卤候选（最近化验达标） */
+  /** 是否进入出卤候选（最近有效化验达标） */
   dischargeReady: boolean;
   /** 走水计划条数 */
   scheduleCount: number;
@@ -152,8 +152,8 @@ function createPondStore() {
         .sort((a, b) => a.date.localeCompare(b.date));
       const latestObs = pondObs.length > 0 ? pondObs[pondObs.length - 1] : null;
       const pondAssays = state.assays
-        .filter((row) => row.pondId === pond.id)
-        .sort((a, b) => a.date.localeCompare(b.date));
+        .filter((row) => row.pondId === pond.id && row.status === '有效')
+        .sort((a, b) => a.date.localeCompare(b.date) || a.round - b.round);
       const latestAssay = pondAssays.length > 0 ? pondAssays[pondAssays.length - 1] : null;
       const verdict = latestAssay === null ? '—' : effectiveVerdict(latestAssay);
       result[pond.id] = {

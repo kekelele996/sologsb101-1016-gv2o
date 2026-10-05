@@ -48,29 +48,34 @@ function observation(
   });
 }
 
-/** 生成化验记录，verdict 默认自动判定 */
+/** 生成化验记录：按取样批次出单；复检链上旧单作废、新单有效，两次结论都保留 */
 function assay(
   id: string,
   pondId: string,
+  sampleBatch: string,
   date: string,
   liGpl: number,
   kGpl: number,
   mgGpl: number,
   naGpl: number,
   labName: string,
-  manual?: { verdict: Assay['verdict']; verdictManual: true },
+  extra?: { status?: Assay['status']; round?: number; retestOf?: string | null; manual?: { verdict: Assay['verdict']; verdictManual: true } },
 ): Assay {
   return wrap<Assay>({
     id,
     pondId,
+    sampleBatch,
     date,
     liGpl,
     kGpl,
     mgGpl,
     naGpl,
     labName,
-    verdict: manual?.verdict ?? autoVerdict(liGpl, kGpl),
-    verdictManual: manual?.verdictManual ?? false,
+    verdict: extra?.manual?.verdict ?? autoVerdict(liGpl, kGpl),
+    verdictManual: extra?.manual?.verdictManual ?? false,
+    status: extra?.status ?? '有效',
+    round: extra?.round ?? 1,
+    retestOf: extra?.retestOf ?? null,
   });
 }
 
@@ -115,26 +120,31 @@ export async function seedDatabase(): Promise<void> {
     observation('obs-e2', SEED_IDS.pondE, '2026-09-04', 1.146, 29, 36, 2),
   ];
 
-  // ---------------- 离子组分分析（含达标 / 接近 / 未达标三种判定） ----------------
+  // ---------------- 离子组分分析（按取样批次出单，含两条复检链：初检作废 + 复检有效） ----------------
   const assays: Assay[] = [
-    assay('assay-a1', SEED_IDS.pondA, '2026-09-22', 0.12, 6.4, 42.5, 88.2, '盐湖中心化验室'),
-    assay('assay-b1', SEED_IDS.pondB, '2026-09-14', 0.72, 15.5, 21.8, 58.4, '盐湖中心化验室'),
-    assay('assay-c1', SEED_IDS.pondC, '2026-09-05', 1.05, 18.2, 9.6, 26.1, '盐湖中心化验室'),
-    assay('assay-c2', SEED_IDS.pondC, '2026-09-18', 1.32, 22.6, 8.4, 24.3, '盐湖中心化验室'),
-    assay('assay-d1', SEED_IDS.pondD, '2026-09-24', 0.08, 4.2, 48.9, 96.5, '南部化验站'),
-    assay('assay-e1', SEED_IDS.pondE, '2026-09-04', 0.48, 13.6, 24.2, 61.7, '南部化验站', {
-      verdict: '接近',
-      verdictManual: true,
+    assay('assay-a1', SEED_IDS.pondA, '北-01-0922', '2026-09-22', 0.12, 6.4, 42.5, 88.2, '盐湖中心化验室'),
+    // 批次 北-02-0914：初检判达标（已作废），复检推翻为「接近」——用过它的 schedule-b2 已退回待排
+    assay('assay-b1', SEED_IDS.pondB, '北-02-0914', '2026-09-14', 1.02, 20.8, 22.4, 57.6, '盐湖中心化验室', { status: '作废', round: 1 }),
+    assay('assay-b2', SEED_IDS.pondB, '北-02-0914', '2026-09-19', 0.72, 15.5, 21.8, 58.4, '盐湖中心化验室', { round: 2, retestOf: 'assay-b1' }),
+    assay('assay-b3', SEED_IDS.pondB, '北-02-0928', '2026-09-28', 1.08, 21.5, 19.6, 55.2, '盐湖中心化验室'),
+    // 批次 北-03-0918：初检「接近」（已作废），复检达标 —— schedule-c1 凭复检结论对账通过
+    assay('assay-c1', SEED_IDS.pondC, '北-03-0918', '2026-09-18', 1.05, 18.2, 9.6, 26.1, '盐湖中心化验室', { status: '作废', round: 1 }),
+    assay('assay-c2', SEED_IDS.pondC, '北-03-0918', '2026-09-24', 1.32, 22.6, 8.4, 24.3, '盐湖中心化验室', { round: 2, retestOf: 'assay-c1' }),
+    assay('assay-d1', SEED_IDS.pondD, '南-04-0924', '2026-09-24', 0.08, 4.2, 48.9, 96.5, '南部化验站'),
+    assay('assay-e1', SEED_IDS.pondE, '南-05-0904', '2026-09-04', 0.48, 13.6, 24.2, 61.7, '南部化验站', {
+      manual: { verdict: '接近', verdictManual: true },
     }),
   ];
 
-  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
+  // ---------------- 走水编排（覆盖四种状态 + 复检退回件，sampleBatch 为对账键） ----------------
   const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, sampleBatch: '北-01-0922', planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1, returnNote: '' }),
+    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, sampleBatch: '南-04-0924', planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2, returnNote: '' }),
+    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, sampleBatch: '北-02-0928', planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3, returnNote: '' }),
+    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, sampleBatch: '北-03-0918', planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4, returnNote: '' }),
+    // 批次 北-02-0914 复检推翻达标结论，该编排被联动退回待排，由调度端本侧重排
+    wrap<Schedule>({ id: 'schedule-b2', pondId: SEED_IDS.pondB, sampleBatch: '北-02-0914', planDate: '2026-10-08', targetDensity: 1.18, volumeM3: 850, operator: '韩江', state: '待排', orderIndex: 5, returnNote: '批次 北-02-0914 第 1 次化验结论作废（复检第 2 次判定「接近」），退回待排' }),
+    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, sampleBatch: '南-05-0904', planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 6, returnNote: '' }),
   ];
 
   await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {

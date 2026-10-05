@@ -129,6 +129,83 @@ export function effectiveVerdict(assay: Pick<Assay, 'verdict' | 'verdictManual' 
   return autoVerdict(assay.liGpl, assay.kGpl);
 }
 
+/* ------------------------------ 批次对账（化验室 ↔ 调度端） ------------------------------ */
+
+/**
+ * 同一取样批次的全部化验轮次（初检 + 各次复检），按轮次升序。
+ * 复检作废的旧单也保留在结果里 —— 化验室把两次结论都留着。
+ */
+export function batchHistory(assays: Assay[], pondId: string, sampleBatch: string): Assay[] {
+  const batch = sampleBatch.trim();
+  if (batch === '') return [];
+  return assays
+    .filter((row) => row.pondId === pondId && row.sampleBatch === batch)
+    .sort((a, b) => a.round - b.round || a.date.localeCompare(b.date));
+}
+
+/** 同一取样批次当前有效的化验单（取轮次最大的一张；无则 null） */
+export function activeAssayOfBatch(assays: Assay[], pondId: string, sampleBatch: string): Assay | null {
+  const active = batchHistory(assays, pondId, sampleBatch).filter((row) => row.status === '有效');
+  return active.length === 0 ? null : active[active.length - 1];
+}
+
+/** 对账结果：调度端排走水时按「池号 + 取样批次」与化验室化验单对账 */
+export interface ReconcileResult {
+  /** 是否对账通过（同批次有效化验单判定达标，允许推进走水） */
+  ok: boolean;
+  /** 对上的有效化验单（未对上为 null） */
+  assay: Assay | null;
+  /** 有效单判定（未对上为 null） */
+  verdict: AssayVerdict | null;
+  /** 该批次已出具的化验轮次数（含作废单） */
+  rounds: number;
+  /** 对账结论说明（不通过原因或通过描述） */
+  reason: string;
+}
+
+/**
+ * 批次对账：化验室对同一批次判了达标，调度端才推进到走水。
+ * - 未登记批次 / 化验室未出单 / 批次单全部作废待复检 / 判定未达标 → 不通过。
+ */
+export function reconcileBatch(pondId: string, sampleBatch: string, assays: Assay[]): ReconcileResult {
+  const batch = sampleBatch.trim();
+  if (batch === '') {
+    return { ok: false, assay: null, verdict: null, rounds: 0, reason: '未登记取样批次，请先在编排单上补登' };
+  }
+  const history = batchHistory(assays, pondId, batch);
+  if (history.length === 0) {
+    return { ok: false, assay: null, verdict: null, rounds: 0, reason: `化验室尚未出具批次 ${batch} 的化验单` };
+  }
+  const active = history.filter((row) => row.status === '有效');
+  if (active.length === 0) {
+    return {
+      ok: false,
+      assay: null,
+      verdict: null,
+      rounds: history.length,
+      reason: `批次 ${batch} 的化验单已作废，等待化验室复检出单`,
+    };
+  }
+  const assay = active[active.length - 1];
+  const verdict = effectiveVerdict(assay);
+  if (verdict !== '达标') {
+    return {
+      ok: false,
+      assay,
+      verdict,
+      rounds: history.length,
+      reason: `批次 ${batch} 第 ${assay.round} 次化验判定为「${verdict}」，未达标`,
+    };
+  }
+  return {
+    ok: true,
+    assay,
+    verdict,
+    rounds: history.length,
+    reason: `批次 ${batch} 第 ${assay.round} 次化验判定达标`,
+  };
+}
+
 /** 密度是否达到目标（用于判断走水是否可以出卤） */
 export function densityReached(currentDensity: number, targetDensity: number): boolean {
   return currentDensity >= targetDensity;
