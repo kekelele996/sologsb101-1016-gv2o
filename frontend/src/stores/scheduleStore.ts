@@ -15,6 +15,7 @@ import {
   removeSchedule,
   reorderSchedules,
 } from '../utils/db';
+import { reconcileSchedule, suggestBatchNo } from '../utils/reconcile';
 import { nowIso, uuid } from '../utils/id';
 import { usePondStore } from './pondStore';
 
@@ -73,11 +74,26 @@ function createScheduleStore() {
     setState('lastMessage', message);
   }
 
+  function resolveBatchNo(pondId: string, planDate: string, raw: string): string {
+    const trimmed = raw.trim();
+    if (trimmed !== '') return trimmed;
+    const pond = usePondStore().state.ponds.find((item) => item.id === pondId);
+    return suggestBatchNo(pond?.code ?? '未命名池', planDate);
+  }
+
+  /** 某条走水编排的对账结果（池号 + 批次 + 达标结论），供页面派生展示 */
+  function reconcileInfo(scheduleId: string) {
+    const row = state.rows.find((item) => item.id === scheduleId);
+    if (row === undefined) return null;
+    return reconcileSchedule(row, usePondStore().state.assays);
+  }
+
   async function createSchedule(draft: ScheduleDraft): Promise<Schedule> {
     const stamp = nowIso();
     const row: Schedule = {
       id: uuid('schedule'),
       pondId: draft.pondId,
+      batchNo: resolveBatchNo(draft.pondId, draft.planDate, draft.batchNo),
       planDate: draft.planDate,
       targetDensity: draft.targetDensity,
       volumeM3: draft.volumeM3,
@@ -86,10 +102,10 @@ function createScheduleStore() {
       orderIndex: draft.orderIndex,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: 3,
     };
     await putSchedule(row);
-    setState('lastMessage', `已新建走水计划：${row.planDate}`);
+    setState('lastMessage', `已新建走水计划：${row.planDate}（批次 ${row.batchNo}）`);
     return row;
   }
 
@@ -99,6 +115,7 @@ function createScheduleStore() {
     await putSchedule({
       ...existing,
       pondId: draft.pondId,
+      batchNo: resolveBatchNo(draft.pondId, draft.planDate, draft.batchNo),
       planDate: draft.planDate,
       targetDensity: draft.targetDensity,
       volumeM3: draft.volumeM3,
@@ -123,7 +140,13 @@ function createScheduleStore() {
     const pondStore = usePondStore();
     const stat = pondStore.statOf(existing.pondId);
     const actualDensity = stat.currentDensity > 0 ? stat.currentDensity : existing.targetDensity;
-    await advanceScheduleState(scheduleId, next, actualDensity);
+    try {
+      await advanceScheduleState(scheduleId, next, actualDensity);
+    } catch (err) {
+      // 对账未通过：不推进，提示原因（池号 + 批次 + 达标结论）
+      setState('lastMessage', `对账未通过：${err instanceof Error ? err.message : '原因未知'}，请先让化验室核对该批次达标结论`);
+      return null;
+    }
     await pondStore.refreshCounts();
     setState(
       'lastMessage',
@@ -166,6 +189,7 @@ function createScheduleStore() {
     draggingId,
     setDraggingId,
     setMessage,
+    reconcileInfo,
     createSchedule,
     updateSchedule,
     deleteSchedule,

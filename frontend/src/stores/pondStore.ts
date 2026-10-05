@@ -12,6 +12,7 @@ import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
 import { DB_SCHEMA_VERSION, ROW_REVISION, countAll, db, initDatabase, putPond, removePond } from '../utils/db';
 import { effectiveVerdict, pondVolumeM3 } from '../utils/brine';
+import { latestValidAssay } from '../utils/reconcile';
 import { nowIso, uuid } from '../utils/id';
 
 /** 单口池的派生统计，供 /ponds、/gates、/export 复用 */
@@ -151,10 +152,7 @@ function createPondStore() {
         .filter((row) => row.pondId === pond.id)
         .sort((a, b) => a.date.localeCompare(b.date));
       const latestObs = pondObs.length > 0 ? pondObs[pondObs.length - 1] : null;
-      const pondAssays = state.assays
-        .filter((row) => row.pondId === pond.id)
-        .sort((a, b) => a.date.localeCompare(b.date));
-      const latestAssay = pondAssays.length > 0 ? pondAssays[pondAssays.length - 1] : null;
+      const latestAssay = latestValidAssay(state.assays, pond.id);
       const verdict = latestAssay === null ? '—' : effectiveVerdict(latestAssay);
       result[pond.id] = {
         pondId: pond.id,

@@ -14,6 +14,7 @@ import { usePondStore } from '../stores/pondStore';
 import { useScheduleStore } from '../stores/scheduleStore';
 import { SCHEDULE_STATE_OPTIONS, type Schedule, type ScheduleDraft, type ScheduleState } from '../types/schedule';
 import { effectiveVerdict } from '../utils/brine';
+import { batchesOfPond, latestValidAssay, reconcileSchedule } from '../utils/reconcile';
 import { today } from '../utils/id';
 
 const INPUT =
@@ -34,6 +35,7 @@ const STATE_STYLE: Record<ScheduleState, string> = {
 function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
   return {
     pondId,
+    batchNo: '',
     planDate: today(),
     targetDensity: 1.15,
     volumeM3: 800,
@@ -86,11 +88,13 @@ export default function ScheduleBoard() {
 
   const stats = createMemo(() => {
     const list = ordered();
+    const returned = list.filter((row) => row.returnedReason !== undefined && row.returnedReason !== '').length;
     return {
       total: list.length,
       pending: list.filter((row) => row.state === '待排').length,
       running: list.filter((row) => row.state === '走水中').length,
       done: list.filter((row) => row.state === '已出卤').length,
+      returned,
       volume: Math.round(list.reduce((acc, row) => acc + row.volumeM3, 0) * 10) / 10,
       donePct: list.length === 0 ? 0 : Math.round((list.filter((row) => row.state === '已出卤').length / list.length) * 1000) / 10,
     };
@@ -107,6 +111,7 @@ export default function ScheduleBoard() {
     setEditingId(row.id);
     setDraft({
       pondId: row.pondId,
+      batchNo: row.batchNo,
       planDate: row.planDate,
       targetDensity: row.targetDensity,
       volumeM3: row.volumeM3,
@@ -116,6 +121,15 @@ export default function ScheduleBoard() {
     });
     setDialogOpen(true);
   };
+
+  /** 某条编排的对账结果（池号 + 批次 + 达标结论） */
+  const reconcileOf = (row: Schedule) => reconcileSchedule(row, pondStore.state.assays);
+
+  /** 当前选中池可用的取样批次（留空则自动生成） */
+  const batchOptions = createMemo<string[]>(() => {
+    if (draft.pondId === '') return [];
+    return batchesOfPond(pondStore.state.assays, draft.pondId);
+  });
 
   const submit = async (): Promise<void> => {
     if (draft.pondId === '') {
@@ -160,6 +174,13 @@ export default function ScheduleBoard() {
         <StatBadge label="待排" value={stats().pending} suffix="条" tone="default" />
         <StatBadge label="走水中" value={stats().running} suffix="条" tone="warning" />
         <StatBadge label="已出卤" value={stats().done} suffix="条" tone="success" />
+        <StatBadge
+          label="已退回待排"
+          value={stats().returned}
+          suffix="条"
+          tone="danger"
+          hint="化验单作废后退回、等待调度端重排的编排"
+        />
         <StatBadge label="计划总量" value={stats().volume} suffix="m³" tone="info" />
         <StatBadge label="出卤完成率" value={`${stats().donePct}%`} percent={stats().donePct} tone="success" />
       </div>
@@ -260,26 +281,67 @@ export default function ScheduleBoard() {
                       组分判定{' '}
                       <span class="font-medium text-slate-800">
                         {(() => {
-                          const list = pondStore.state.assays
-                            .filter((item) => item.pondId === row.pondId)
-                            .sort((a, b) => a.date.localeCompare(b.date));
-                          return list.length === 0 ? '未化验' : effectiveVerdict(list[list.length - 1]);
+                          const latest = latestValidAssay(pondStore.state.assays, row.pondId);
+                          return latest === null ? '未化验' : effectiveVerdict(latest);
                         })()}
                       </span>
                     </p>
                   </div>
+                  <div class="text-xs text-slate-600">
+                    <p>
+                      对账批次 <span class="tabular-nums font-medium text-slate-800">{row.batchNo || '—'}</span>
+                    </p>
+                    <p>
+                      对账状态{' '}
+                      {(() => {
+                        const result = reconcileOf(row);
+                        if (result === null) return <span class="text-slate-400">—</span>;
+                        const style =
+                          result.status === '对账通过'
+                            ? 'border-emerald-300 bg-emerald-50 text-emerald-700'
+                            : result.status === '对账不通过'
+                              ? 'border-rose-300 bg-rose-50 text-rose-700'
+                              : 'border-slate-300 bg-slate-100 text-slate-500';
+                        return (
+                          <span class={`rounded border px-1.5 py-0.5 text-[11] ${style}`} title={result.reason}>
+                            {result.status}
+                          </span>
+                        );
+                      })()}
+                    </p>
+                  </div>
                   <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
+                  <Show when={row.returnedReason !== undefined && row.returnedReason !== ''}>
+                    <p class="w-full rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-800">
+                      已退回待排：{row.returnedReason}
+                    </p>
+                  </Show>
                   <div class="flex flex-wrap items-center gap-2">
-                    <button
-                      class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"
-                      disabled={row.state === '已出卤'}
-                      onClick={async () => {
-                        const next = await scheduleStore.advance(row.id);
-                        if (next === null) scheduleStore.setMessage('该计划已处于「已出卤」状态');
-                      }}
-                    >
-                      {nextStateLabel(row.state)}
-                    </button>
+                    {(() => {
+                      const result = reconcileOf(row);
+                      const blocked =
+                        row.state !== '已出卤' &&
+                        row.state !== '走水中' &&
+                        (result === null || result.status !== '对账通过');
+                      const title = blocked
+                        ? result?.reason ?? '对账未通过，不能推进走水'
+                        : '';
+                      return (
+                        <button
+                          class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={row.state === '已出卤' || blocked}
+                          title={title}
+                          onClick={async () => {
+                            const next = await scheduleStore.advance(row.id);
+                            if (next === null && row.state !== '已出卤') {
+                              scheduleStore.setMessage('对账未通过：请先让化验室核对该批次达标结论');
+                            }
+                          }}
+                        >
+                          {nextStateLabel(row.state)}
+                        </button>
+                      );
+                    })()}
                     <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
                       编辑
                     </button>
@@ -333,6 +395,13 @@ export default function ScheduleBoard() {
             </select>
           </label>
           <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+            <span>取样批次（对账用）</span>
+            <select class={INPUT} value={draft.batchNo} onChange={(event) => setDraft('batchNo', event.currentTarget.value)}>
+              <option value="">按池号 + 计划日期自动生成</option>
+              <For each={batchOptions()}>{(batch) => <option value={batch}>{batch}</option>}</For>
+            </select>
+          </label>
+          <label class="flex flex-col gap-1 text-[13px] text-slate-600">
             <span>计划走水日期</span>
             <input type="date" class={INPUT} value={draft.planDate} onInput={(event) => setDraft('planDate', event.currentTarget.value)} />
           </label>
@@ -379,6 +448,7 @@ export default function ScheduleBoard() {
           </label>
         </div>
         <p class="mt-3 rounded-md bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-500">
+          排走水时按「池号 + 取样批次」与化验室对账，化验室对同一批次判了达标才能推进到走水；
           状态推进到「已出卤」时，会把该池推进到下一蒸发阶段，并把最新一次观测的密度回写为当前实际密度。
         </p>
       </AppDialog>

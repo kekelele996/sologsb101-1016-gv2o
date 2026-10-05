@@ -7,7 +7,7 @@ import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
-import { DB_NAME, DB_SCHEMA_VERSION, exportSnapshot, importSnapshot, resetDatabase } from '../utils/db';
+import { DB_NAME, DB_SCHEMA_VERSION, dismissMigrationReport, exportSnapshot, getMigrationReport, importSnapshot, resetDatabase, type MigrationReport } from '../utils/db';
 import { buildBriefingText, copyText, exportProgressCsvFile, exportSnapshotJson, parseSnapshot } from '../utils/export';
 import { effectiveVerdict } from '../utils/brine';
 
@@ -19,6 +19,7 @@ export default function ExportView() {
   const store = usePondStore();
   const [message, setMessage] = createSignal('');
   const [resetOpen, setResetOpen] = createSignal(false);
+  const [migrationReport, setMigrationReport] = createSignal<MigrationReport | null>(getMigrationReport());
 
   onMount(() => {
     void store.loadAll();
@@ -80,9 +81,13 @@ export default function ExportView() {
       setMessage(`导入失败：${result.message}`);
       return;
     }
-    await importSnapshot(result.snapshot);
+    const imported = await importSnapshot(result.snapshot);
     await store.loadAll();
-    setMessage(`导入成功：${result.message}`);
+    const backfillNote =
+      imported.assaysBackfilled > 0 || imported.schedulesBackfilled > 0
+        ? `；导入时按池号回填批次（化验单 ${imported.assaysBackfilled} 条、走水编排 ${imported.schedulesBackfilled} 条）`
+        : '';
+    setMessage(`导入成功：${result.message}${backfillNote}`);
   };
 
   const handleReset = async (): Promise<void> => {
@@ -119,6 +124,60 @@ export default function ExportView() {
 
       <Show when={message() !== ''}>
         <div class="rounded-lg border border-brine-200 bg-brine-50 px-3.5 py-2 text-sm text-brine-800">{message()}</div>
+      </Show>
+
+      <Show when={migrationReport() !== null}>
+        <section class="rounded-xl border border-amber-200 bg-amber-50 p-4">
+          <header class="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <h2 class="text-[15px] font-semibold text-amber-900">v3 升级回填报告（取样批次）</h2>
+            <button
+              class={BTN_GHOST}
+              onClick={() => {
+                dismissMigrationReport();
+                setMigrationReport(null);
+              }}
+            >
+              已知悉
+            </button>
+          </header>
+          <p class="text-sm leading-relaxed text-amber-800">
+            旧数据未登记取样批次，升级时按池号回填：化验单回填{' '}
+            <span class="font-semibold">{migrationReport()?.assaysBackfilled}</span> 条，走水编排回填{' '}
+            <span class="font-semibold">{migrationReport()?.schedulesBackfilled}</span> 条。
+            以下记录对不上、无法回填，已单列，请人工核对补登批次。
+          </p>
+          <Show
+            when={(migrationReport()?.unmatched.length ?? 0) > 0}
+            fallback={<p class="mt-2 text-xs text-amber-700">没有对不上的记录。</p>}
+          >
+            <div class="mt-2 overflow-x-auto">
+              <table class="w-full min-w-[720px] border-collapse text-sm">
+                <thead>
+                  <tr class="border-b border-amber-200 bg-amber-100/60 text-left text-xs text-amber-800">
+                    <th class="px-3 py-2">来源</th>
+                    <th class="px-3 py-2">记录 id</th>
+                    <th class="px-3 py-2">池号 id</th>
+                    <th class="px-3 py-2">日期</th>
+                    <th class="px-3 py-2">原因</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={migrationReport()?.unmatched ?? []}>
+                    {(item) => (
+                      <tr class="border-b border-amber-100 text-amber-900">
+                        <td class="px-3 py-2">{item.table === 'assays' ? '化验单' : '走水编排'}</td>
+                        <td class="px-3 py-2 font-mono text-xs">{item.id}</td>
+                        <td class="px-3 py-2 font-mono text-xs">{item.pondId}</td>
+                        <td class="px-3 py-2 tabular-nums">{item.date}</td>
+                        <td class="px-3 py-2 text-xs">{item.reason}</td>
+                      </tr>
+                    )}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+          </Show>
+        </section>
       </Show>
 
       <section class="rounded-xl border border-slate-200 bg-white p-4">

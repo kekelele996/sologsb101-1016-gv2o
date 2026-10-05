@@ -19,7 +19,8 @@ import {
   type AssayVerdict,
 } from '../types/assay';
 import { ASSAY_THRESHOLD, autoVerdict, effectiveVerdict, ionEquivalent } from '../utils/brine';
-import { db, putAssay, removeAssay } from '../utils/db';
+import { db, putAssay, removeAssay, voidAssayForRetest } from '../utils/db';
+import { suggestBatchNo } from '../utils/reconcile';
 import { nowIso, today, uuid } from '../utils/id';
 
 const INPUT =
@@ -36,9 +37,10 @@ const VERDICT_STYLE: Record<AssayVerdict, string> = {
   未达标: 'border-slate-300 bg-slate-100 text-slate-500',
 };
 
-function emptyDraft(pondId: string): AssayDraft {
+function emptyDraft(pondId: string, pondCode = ''): AssayDraft {
   return {
     pondId,
+    batchNo: pondCode === '' ? '' : suggestBatchNo(pondCode, today()),
     date: today(),
     liGpl: 0.5,
     kGpl: 12,
@@ -63,7 +65,11 @@ export default function AssayEntry() {
   const [from, setFrom] = createSignal('');
   const [to, setTo] = createSignal('');
   const [curvePondId, setCurvePondId] = createSignal('');
+  const [showVoided, setShowVoided] = createSignal(false);
+  const [retesting, setRetesting] = createSignal<Assay | null>(null);
+  const [retestMessage, setRetestMessage] = createSignal('');
   const [draft, setDraft] = createStore<AssayDraft>(emptyDraft(''));
+  const [retestDraft, setRetestDraft] = createStore<AssayDraft>(emptyDraft(''));
 
   onMount(() => {
     void pondStore.loadAll();
@@ -95,6 +101,7 @@ export default function AssayEntry() {
     const series = pondStore.state.currentSeries;
     const key = keyword().trim().toLowerCase();
     return rows().filter((row) => {
+      if (!showVoided() && row.status === '作废') return false;
       const pond = pondOf(row.pondId);
       if (series !== null && pond?.seriesName !== series) return false;
       if (from() !== '' && row.date < from()) return false;
@@ -103,24 +110,29 @@ export default function AssayEntry() {
       return (
         pondLabel(row.pondId).toLowerCase().includes(key) ||
         row.labName.toLowerCase().includes(key) ||
-        row.date.includes(key)
+        row.date.includes(key) ||
+        row.batchNo.toLowerCase().includes(key)
       );
     });
   });
 
   const stats = createMemo(() => {
     const list = filtered();
-    const pass = list.filter((row) => effectiveVerdict(row) === '达标').length;
-    const near = list.filter((row) => effectiveVerdict(row) === '接近').length;
-    const fail = list.filter((row) => effectiveVerdict(row) === '未达标').length;
-    const readyPonds = new Set(list.filter((row) => effectiveVerdict(row) === '达标').map((row) => row.pondId)).size;
+    const valid = list.filter((row) => row.status !== '作废');
+    const pass = valid.filter((row) => effectiveVerdict(row) === '达标').length;
+    const near = valid.filter((row) => effectiveVerdict(row) === '接近').length;
+    const fail = valid.filter((row) => effectiveVerdict(row) === '未达标').length;
+    const voided = list.filter((row) => row.status === '作废').length;
+    const readyPonds = new Set(valid.filter((row) => effectiveVerdict(row) === '达标').map((row) => row.pondId)).size;
     return {
       total: list.length,
+      valid: valid.length,
       pass,
       near,
       fail,
+      voided,
       readyPonds,
-      passPct: list.length === 0 ? 0 : Math.round((pass / list.length) * 1000) / 10,
+      passPct: valid.length === 0 ? 0 : Math.round((pass / valid.length) * 1000) / 10,
     };
   });
 
@@ -157,15 +169,18 @@ export default function AssayEntry() {
       curvePondId() !== ''
         ? curvePondId()
         : (pondStore.pondsOfSeries(pondStore.state.currentSeries)[0]?.id ?? pondStore.state.ponds[0]?.id ?? '');
+    const pond = pondOf(pondId);
     setEditingId(null);
-    setDraft(emptyDraft(pondId));
+    setDraft(emptyDraft(pondId, pond?.code ?? ''));
     setDialogOpen(true);
   };
 
   const openEdit = (row: Assay): void => {
+    if (row.status === '作废') return;
     setEditingId(row.id);
     setDraft({
       pondId: row.pondId,
+      batchNo: row.batchNo,
       date: row.date,
       liGpl: row.liGpl,
       kGpl: row.kGpl,
@@ -178,14 +193,61 @@ export default function AssayEntry() {
     setDialogOpen(true);
   };
 
+  const openRetest = (row: Assay): void => {
+    setRetesting(row);
+    setRetestMessage('');
+    setRetestDraft({
+      pondId: row.pondId,
+      batchNo: row.batchNo,
+      date: today(),
+      liGpl: row.liGpl,
+      kGpl: row.kGpl,
+      mgGpl: row.mgGpl,
+      naGpl: row.naGpl,
+      labName: row.labName,
+      verdict: row.verdict,
+      verdictManual: row.verdictManual,
+    });
+  };
+
+  const submitRetest = async (): Promise<void> => {
+    const original = retesting();
+    if (original === null) return;
+    try {
+      const { newId, returnedSchedules } = await voidAssayForRetest(original.id, {
+        date: retestDraft.date,
+        liGpl: retestDraft.liGpl,
+        kGpl: retestDraft.kGpl,
+        mgGpl: retestDraft.mgGpl,
+        naGpl: retestDraft.naGpl,
+        labName: retestDraft.labName.trim() || '未填写化验室',
+        verdict: retestDraft.verdict,
+        verdictManual: retestDraft.verdictManual,
+      });
+      setRetestMessage(
+        `复检已录入（新单 ${newId}），原化验单已作废，两次结论都保留。` +
+          (returnedSchedules.length > 0
+            ? ` ${returnedSchedules.length} 条引用该批次的走水编排已退回待排，请通知调度端重排。`
+            : ' 没有引用该批次的在排编排。'),
+      );
+      setRetesting(null);
+    } catch (err) {
+      setRetestMessage(err instanceof Error ? err.message : '复检失败');
+    }
+  };
+
   const submit = async (): Promise<void> => {
     if (draft.pondId === '') {
       setMessage('请选择蒸发池');
       return;
     }
+    const pond = pondOf(draft.pondId);
+    const batchNo =
+      draft.batchNo.trim() !== '' ? draft.batchNo.trim() : suggestBatchNo(pond?.code ?? '未命名池', draft.date);
     const payload: Omit<Assay, 'createdAt' | 'updatedAt' | 'revision'> = {
       id: editingId() ?? uuid('assay'),
       pondId: draft.pondId,
+      batchNo,
       date: draft.date,
       liGpl: draft.liGpl,
       kGpl: draft.kGpl,
@@ -194,20 +256,21 @@ export default function AssayEntry() {
       labName: draft.labName.trim() || '未填写化验室',
       verdict: draft.verdictManual ? draft.verdict : previewVerdict(),
       verdictManual: draft.verdictManual,
+      status: '有效',
     };
     if (editingId() === null) {
       const stamp = nowIso();
-      await putAssay({ ...payload, createdAt: stamp, updatedAt: stamp, revision: 2 });
+      await putAssay({ ...payload, createdAt: stamp, updatedAt: stamp, revision: 3 });
       setMessage(
         payload.verdict === '达标'
-          ? `已录入 ${pondLabel(payload.pondId)} 的化验记录，判定达标，该池进入出卤候选`
-          : `已录入 ${pondLabel(payload.pondId)} 的化验记录，判定为「${payload.verdict}」`,
+          ? `已录入 ${pondLabel(payload.pondId)} 的化验单（批次 ${batchNo}），判定达标，该池进入出卤候选`
+          : `已录入 ${pondLabel(payload.pondId)} 的化验单（批次 ${batchNo}），判定为「${payload.verdict}」`,
       );
     } else {
       const existing = rows().find((row) => row.id === editingId());
       if (existing === undefined) return;
       await putAssay({ ...existing, ...payload });
-      setMessage('化验记录已更新');
+      setMessage('化验单已更新');
     }
     setDialogOpen(false);
   };
@@ -223,7 +286,9 @@ export default function AssayEntry() {
   return (
     <div class="space-y-3.5">
       <div class="flex flex-wrap gap-3">
-        <StatBadge label="化验记录" value={stats().total} suffix="条" tone="primary" />
+        <StatBadge label="化验单" value={stats().total} suffix="条" tone="primary" />
+        <StatBadge label="有效" value={stats().valid} suffix="条" tone="success" />
+        <StatBadge label="作废" value={stats().voided} suffix="条" tone="danger" />
         <StatBadge label="达标" value={stats().pass} suffix="条" tone="success" />
         <StatBadge label="接近" value={stats().near} suffix="条" tone="warning" />
         <StatBadge label="未达标" value={stats().fail} suffix="条" tone="default" />
@@ -233,12 +298,15 @@ export default function AssayEntry() {
           value={stats().readyPonds}
           suffix="口"
           tone={stats().readyPonds > 0 ? 'success' : 'default'}
-          hint="区间内存在达标化验记录的池数量"
+          hint="区间内存在达标有效化验单的池数量"
         />
       </div>
 
       <Show when={message() !== ''}>
         <div class="rounded-lg border border-brine-200 bg-brine-50 px-3.5 py-2 text-sm text-brine-800">{message()}</div>
+      </Show>
+      <Show when={retestMessage() !== ''}>
+        <div class="rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2 text-sm text-amber-800">{retestMessage()}</div>
       </Show>
 
       <section class="rounded-xl border border-slate-200 bg-white p-4">
@@ -281,6 +349,10 @@ export default function AssayEntry() {
               onInput={(event) => setTo(event.currentTarget.value)}
             />
           </label>
+          <label class="flex items-center gap-1.5 text-[13px] text-slate-600">
+            <input type="checkbox" checked={showVoided()} onChange={(event) => setShowVoided(event.currentTarget.checked)} />
+            <span>显示作废化验单</span>
+          </label>
         </FilterBar>
 
         <Show when={rows().length === 0 && !loading()}>
@@ -294,11 +366,12 @@ export default function AssayEntry() {
 
         <Show when={rows().length > 0}>
           <div class="overflow-x-auto">
-            <table class="w-full min-w-[1080px] border-collapse text-sm">
+            <table class="w-full min-w-[1160px] border-collapse text-sm">
               <thead>
                 <tr class="border-b border-slate-200 bg-slate-50 text-left text-xs text-slate-500">
                   <th class="px-3 py-2">蒸发池</th>
                   <th class="px-3 py-2">阶段</th>
+                  <th class="px-3 py-2">取样批次</th>
                   <th class="px-3 py-2">取样日期</th>
                   <th class="px-3 py-2 text-right">Li⁺（g/L）</th>
                   <th class="px-3 py-2 text-right">K⁺（g/L）</th>
@@ -307,6 +380,7 @@ export default function AssayEntry() {
                   <th class="px-3 py-2 text-right">当量合计（meq/L）</th>
                   <th class="px-3 py-2">化验室</th>
                   <th class="px-3 py-2">判定</th>
+                  <th class="px-3 py-2">状态</th>
                   <th class="px-3 py-2">操作</th>
                 </tr>
               </thead>
@@ -314,12 +388,18 @@ export default function AssayEntry() {
                 <For each={filtered()}>
                   {(row) => {
                     const verdict = (): AssayVerdict => effectiveVerdict(row);
+                    const voided = (): boolean => row.status === '作废';
                     return (
-                      <tr class="border-b border-slate-100 hover:bg-slate-50/60">
+                      <tr
+                        class={`border-b border-slate-100 ${
+                          voided() ? 'bg-slate-50/70 text-slate-400' : 'hover:bg-slate-50/60'
+                        }`}
+                      >
                         <td class="px-3 py-2.5">{pondLabel(row.pondId)}</td>
                         <td class="px-3 py-2.5">
                           <StageTag stage={pondOf(row.pondId)?.stage ?? null} size="sm" />
                         </td>
+                        <td class="px-3 py-2.5 text-xs tabular-nums">{row.batchNo || '—'}</td>
                         <td class="px-3 py-2.5">{row.date}</td>
                         <td class="px-3 py-2.5 text-right tabular-nums">{row.liGpl}</td>
                         <td class="px-3 py-2.5 text-right tabular-nums">{row.kGpl}</td>
@@ -336,10 +416,30 @@ export default function AssayEntry() {
                           </span>
                         </td>
                         <td class="px-3 py-2.5">
+                          <Show
+                            when={voided()}
+                            fallback={<span class="rounded border border-emerald-300 bg-emerald-50 px-1.5 py-0.5 text-[11px] text-emerald-700">有效</span>}
+                          >
+                            <span class="rounded border border-rose-300 bg-rose-50 px-1.5 py-0.5 text-[11px] text-rose-700">
+                              作废{row.voidReason ? ` · ${row.voidReason}` : ''}
+                            </span>
+                          </Show>
+                        </td>
+                        <td class="px-3 py-2.5">
                           <div class="flex gap-2">
-                            <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
-                              编辑
-                            </button>
+                            <Show when={!voided()}>
+                              <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
+                                编辑
+                              </button>
+                              <button class="text-xs text-amber-700 hover:underline" onClick={() => openRetest(row)}>
+                                复检
+                              </button>
+                            </Show>
+                            <Show when={voided() && row.retestBy}>
+                              <span class="text-xs text-slate-400" title={`复检新单：${row.retestBy ?? ''}`}>
+                                已复检
+                              </span>
+                            </Show>
                             <button class="text-xs text-rose-600 hover:underline" onClick={() => setDeleting(row)}>
                               删除
                             </button>
@@ -479,6 +579,15 @@ export default function AssayEntry() {
             </select>
           </label>
           <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+            <span>取样批次</span>
+            <input
+              class={INPUT}
+              placeholder="留空则按池号 + 日期自动生成"
+              value={draft.batchNo}
+              onInput={(event) => setDraft('batchNo', event.currentTarget.value)}
+            />
+          </label>
+          <label class="flex flex-col gap-1 text-[13px] text-slate-600">
             <span>取样日期</span>
             <input type="date" class={INPUT} value={draft.date} onInput={(event) => setDraft('date', event.currentTarget.value)} />
           </label>
@@ -561,7 +670,7 @@ export default function AssayEntry() {
 
       <AppDialog
         open={deleting() !== null}
-        title="确认删除化验记录？"
+        title="确认删除化验单？"
         width="max-w-lg"
         onClose={() => setDeleting(null)}
         footer={
@@ -576,8 +685,133 @@ export default function AssayEntry() {
         }
       >
         <p class="text-sm leading-relaxed text-slate-600">
-          将删除「{pondLabel(deleting()?.pondId ?? '')}」在 {deleting()?.date} 的化验记录，删除后该池可能不再属于出卤候选。
+          将删除「{pondLabel(deleting()?.pondId ?? '')}」在 {deleting()?.date} 的化验单，删除后该池可能不再属于出卤候选。
+          {deleting()?.status === '作废' ? ' 该单已作废，删除不影响在编编排。' : ''}
         </p>
+      </AppDialog>
+
+      <AppDialog
+        open={retesting() !== null}
+        title="复检录入（原化验单作废）"
+        onClose={() => setRetesting(null)}
+        footer={
+          <>
+            <button class={BTN_GHOST} onClick={() => setRetesting(null)}>
+              取消
+            </button>
+            <button class={BTN_PRIMARY} onClick={() => void submitRetest()}>
+              保存复检
+            </button>
+          </>
+        }
+      >
+        <Show when={retesting() !== null}>
+          <div class="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800">
+            复检针对同一取样批次 <span class="font-semibold">{retesting()?.batchNo}</span>（原 {retesting()?.date} 化验单）。
+            保存后原化验单标记「作废」，两次结论都保留；引用该批次的已排 / 走水中编排会被退回待排，由调度端重排。
+          </div>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+              <span>蒸发池</span>
+              <select class={INPUT} value={retestDraft.pondId} disabled>
+                <For each={pondStore.state.ponds}>
+                  {(pond) => (
+                    <option value={pond.id}>
+                      {pond.code} · {pond.seriesName} · {pond.stage}
+                    </option>
+                  )}
+                </For>
+              </select>
+            </label>
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+              <span>取样批次</span>
+              <input class={INPUT} value={retestDraft.batchNo} disabled />
+            </label>
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+              <span>复检日期</span>
+              <input
+                type="date"
+                class={INPUT}
+                value={retestDraft.date}
+                onInput={(event) => setRetestDraft('date', event.currentTarget.value)}
+              />
+            </label>
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+              <span>化验室</span>
+              <input
+                class={INPUT}
+                value={retestDraft.labName}
+                onInput={(event) => setRetestDraft('labName', event.currentTarget.value)}
+              />
+            </label>
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+              <span>Li⁺（g/L）</span>
+              <input
+                type="number"
+                step="0.01"
+                class={INPUT}
+                value={retestDraft.liGpl}
+                onInput={(event) => setRetestDraft('liGpl', Number(event.currentTarget.value))}
+              />
+            </label>
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+              <span>K⁺（g/L）</span>
+              <input
+                type="number"
+                step="0.1"
+                class={INPUT}
+                value={retestDraft.kGpl}
+                onInput={(event) => setRetestDraft('kGpl', Number(event.currentTarget.value))}
+              />
+            </label>
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+              <span>Mg²⁺（g/L）</span>
+              <input
+                type="number"
+                step="0.1"
+                class={INPUT}
+                value={retestDraft.mgGpl}
+                onInput={(event) => setRetestDraft('mgGpl', Number(event.currentTarget.value))}
+              />
+            </label>
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+              <span>Na⁺（g/L）</span>
+              <input
+                type="number"
+                step="0.1"
+                class={INPUT}
+                value={retestDraft.naGpl}
+                onInput={(event) => setRetestDraft('naGpl', Number(event.currentTarget.value))}
+              />
+            </label>
+            <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+              <span>判定方式</span>
+              <span class="flex items-center gap-2 pt-1">
+                <input
+                  type="checkbox"
+                  checked={retestDraft.verdictManual}
+                  onChange={(event) => setRetestDraft('verdictManual', event.currentTarget.checked)}
+                />
+                <span class="text-slate-500">人工覆盖自动判定</span>
+              </span>
+            </label>
+            <Show when={retestDraft.verdictManual}>
+              <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+                <span>人工判定结果</span>
+                <select
+                  class={INPUT}
+                  value={retestDraft.verdict}
+                  onChange={(event) => setRetestDraft('verdict', event.currentTarget.value as AssayVerdict)}
+                >
+                  <For each={ASSAY_VERDICT_OPTIONS}>{(verdict) => <option value={verdict}>{verdict}</option>}</For>
+                </select>
+              </label>
+            </Show>
+          </div>
+          <p class="mt-3 rounded-md bg-brine-50 px-3 py-2 text-xs leading-relaxed text-brine-800">
+            自动判定结果为「{autoVerdict(retestDraft.liGpl, retestDraft.kGpl)}」；保存后原作废单与复检新单都可在列表中查看。
+          </p>
+        </Show>
       </AppDialog>
     </div>
   );

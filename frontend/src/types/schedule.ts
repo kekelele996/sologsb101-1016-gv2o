@@ -15,6 +15,8 @@ export interface Schedule {
   id: string
   /** 所属蒸发池 */
   pondId: string
+  /** 对账用取样批次号：排走水时与化验室按「池号 + 批次」对账 */
+  batchNo: string
   /** 计划走水日期 YYYY-MM-DD */
   planDate: string
   /** 目标密度（g/cm³） */
@@ -27,6 +29,8 @@ export interface Schedule {
   state: ScheduleState
   /** 手工拖拽后的排序序号，越小越先走水 */
   orderIndex: number
+  /** 化验单作废后退回待排的原因（复检作废时写入） */
+  returnedReason?: string
   createdAt: string
   updatedAt: string
   revision: number
@@ -35,6 +39,8 @@ export interface Schedule {
 /** 新建 / 编辑走水编排的表单草稿 */
 export interface ScheduleDraft {
   pondId: string
+  /** 取样批次号（留空则按池号 + 计划日期自动生成） */
+  batchNo: string
   planDate: string
   targetDensity: number
   volumeM3: number
